@@ -1,0 +1,83 @@
+name: Deploy to Hostinger
+
+on:
+  workflow_dispatch:
+    inputs:
+      backup_confirmed:
+        description: 'I verified a restorable database backup and reviewed migrations'
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.event.inputs.backup_confirmed == 'true' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - name: Check out the selected commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Build production release
+        shell: bash
+        run: |
+          set -euo pipefail
+          php_bin=$(command -v php8.3)
+          composer_bin=$(command -v composer)
+          "$php_bin" -r 'if (PHP_VERSION_ID < 80300 || PHP_VERSION_ID >= 80400) { fwrite(STDERR, "The build must use PHP 8.3.\n"); exit(1); }'
+          node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major < 20 || (major === 20 && minor < 19) || (major === 22 && minor < 12) || major === 21) process.exit(1)'
+          "$php_bin" "$composer_bin" validate --no-check-publish
+          "$php_bin" "$composer_bin" audit --locked --no-dev
+          "$php_bin" "$composer_bin" install --no-dev --no-interaction --no-progress --prefer-dist --optimize-autoloader --no-scripts
+          "$php_bin" "$composer_bin" check-platform-reqs --no-dev
+          npm ci
+          npm run build
+          mkdir -p "$RUNNER_TEMP/release"
+          git archive "$GITHUB_SHA" | tar -xf - -C "$RUNNER_TEMP/release"
+          if [[ -e "$RUNNER_TEMP/release/.env" || -e "$RUNNER_TEMP/release/public/hot" ]]; then
+            echo 'Refusing to package a tracked .env or public/hot file.' >&2
+            exit 1
+          fi
+          cp -a vendor "$RUNNER_TEMP/release/vendor"
+          mkdir -p "$RUNNER_TEMP/release/public"
+          cp -a public/build "$RUNNER_TEMP/release/public/build"
+          tar -czf "$RUNNER_TEMP/release.tar.gz" -C "$RUNNER_TEMP/release" .
+
+      - name: Upload and activate release
+        shell: bash
+        env:
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+          SSH_USER: ${{ vars.SSH_USER }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          PHP_BIN: ${{ vars.PHP_BIN }}
+          COMPOSER_BIN: ${{ vars.COMPOSER_BIN }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ "$SSH_HOST" =~ ^[a-zA-Z0-9.-]+$ && "$SSH_USER" =~ ^[a-zA-Z0-9_-]+$ && "$SSH_PORT" =~ ^[0-9]{1,5}$ ]] || { echo 'Invalid SSH settings.' >&2; exit 1; }
+          (( 10#$SSH_PORT >= 1 && 10#$SSH_PORT <= 65535 )) || exit 1
+          for path in "$DEPLOY_PATH" "$PHP_BIN" "$COMPOSER_BIN"; do
+            [[ "$path" =~ ^/[a-zA-Z0-9_./-]+$ && "$path" != *..* && "$path" != / ]] || { echo 'Paths must be safe absolute paths.' >&2; exit 1; }
+          done
+          [[ -n "$SSH_PRIVATE_KEY" && -n "$SSH_KNOWN_HOSTS" ]] || { echo 'SSH credentials are missing.' >&2; exit 1; }
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/deploy_key" "$HOME/.ssh/known_hosts"
+          release_id="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ssh_options=(-i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o BatchMode=yes)
+          ssh "${ssh_options[@]}" -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "mkdir -p '$DEPLOY_PATH/incoming'"
+          scp "${ssh_options[@]}" -P "$SSH_PORT" "$RUNNER_TEMP/release.tar.gz" "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/incoming/$release_id.tar.gz"
+          ssh "${ssh_options[@]}" -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "bash -s -- '$DEPLOY_PATH' '$release_id' '$PHP_BIN' '$COMPOSER_BIN'" < scripts/deploy-hostinger.sh
